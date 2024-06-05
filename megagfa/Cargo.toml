@@ -1,0 +1,18 @@
+[package]
+name = "megagfa"
+version = "0.1.0"
+authors = ["Jakob Nybo Nissen <jakobnybonissen@gmail.com>"]
+license = "MIT"
+edition = "2021"
+description = "Print minimal GFA file from MEGAHIT contigs"
+readme = "README.md"
+
+[dependencies]
+anyhow = "1.0.86"
+bio = "1.6.0"
+clap = { version = "4.5.4", features = ["derive"] }
+regex = "1.10.4"
+smallvec = "1.13.2"
+
+[profile.release]
+lto = true
