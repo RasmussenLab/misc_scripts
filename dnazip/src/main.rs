@@ -3,7 +3,6 @@ use clap::Parser;
 
 use crossbeam_channel::{self, Receiver, RecvError, TryRecvError};
 use flate2::{bufread::GzEncoder, Compression};
-use size;
 use std::io::{stderr, ErrorKind, Write};
 use std::{
     fs::File,
@@ -29,7 +28,7 @@ struct Cli {
     #[arg(short, long)]
     verbose: bool,
 
-    /// Number of additional threads to use for compression [0]
+    /// Number of additional threads to use for compression
     #[arg(short, long, default_value_t = 0)]
     threads: u8,
 }
@@ -55,13 +54,12 @@ fn write_path(path: &Path, prefix: Option<&str>) {
     v.write_all(path.as_os_str().as_encoded_bytes()).unwrap();
     v.write_all(&[b'\n']).unwrap();
     stderr().write_all(&v).unwrap()
-
 }
 
 fn compress(path: &Path, dry_run: bool, verbose: bool) -> anyhow::Result<()> {
     if dry_run {
         write_path(path, Some("Would compress: "));
-        return Ok(())
+        return Ok(());
     }
     let mut p = path.as_os_str().to_owned();
     p.push(".gz");
@@ -95,7 +93,6 @@ fn main() {
     let args = Cli::parse();
     let mut n_files = 0;
     let mut n_bytes = 0;
-    // We cap the channel to hold a number of entries which is low enough that it won't
     let (sender, reciever) = crossbeam_channel::unbounded::<PathBuf>();
     let handles: Vec<_> = (0..args.threads)
         .map(|_| {
