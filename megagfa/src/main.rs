@@ -19,6 +19,8 @@ fn main() -> Result<()> {
     if args.k == 0 {
         exitwith("The value of K cannot be zero")
     }
+    // We can read from stdin, from a file, or from a gzipped file. In any case, we wrap the result
+    // in a BufRead so we can guarantee the input type implements BufRead.
     let input: Box<dyn BufRead> = if let Some(p) = args.i {
         if !p.is_file() {
             exitwith(&format!(
@@ -26,6 +28,8 @@ fn main() -> Result<()> {
                 p.to_string_lossy()
             ));
         }
+        // Check if the user passes e.g. a file k79.contigs.fa, but passes -k 75, where the values
+        // of k differ. This will raise an error.
         p.file_name().and_then(|f| f.to_str()).and_then(|s| {
             let re = Regex::new(r"^k(\d+)\.contigs\.fa$").unwrap();
             re.captures(s).map(|c| (c, s))
@@ -36,6 +40,8 @@ fn main() -> Result<()> {
             }
             None::<()>
         });
+        // Return a BufReader wrapping either the opened file directly, or a gzip reader if the file name
+        // ends with .gz.
         let file = std::fs::File::open(p.clone())
             .with_context(|| format!("Could not open input file \"{}\"", p.to_string_lossy()))?;
         if p.extension().is_some_and(|e| e == "gz") {
@@ -44,18 +50,28 @@ fn main() -> Result<()> {
             Box::new(BufReader::new(file))
         }
     } else {
-        Box::new(BufReader::new(stdin().lock()))
+        // A locked stdin implements BufRead, so we can use that directly.
+        // Also, no other part of this program reads stdin, so there is no downside.
+        Box::new(stdin().lock())
     };
-    let (identifiers, edges) = build_graph(input, args.k, args.min_contig_length as usize)?;
-    write_gfa(&identifiers, &edges)?;
+    let (identifiers, edges) = find_edges(input, args.k, args.min_contig_length as usize)?;
+    print_gfa(&identifiers, &edges)?;
     Ok(())
 }
 
+// Contains the index of the contig the kmer came from, and whether it's reverse-complement
+// or not.
+// The last bit of information needed to identify a kmer is whether it's the ending or the starting kmer,
+// but this is stored implicitly as the end/start kmers are stored in two different
+// data structures in this program.
+// The information is packed into 32 bits in order to save memory, and to make the data structures
+// that store KmerData smaller and therefore faster.
 #[derive(Clone, Copy)]
 struct KmerData(u32);
 
 impl KmerData {
     fn try_new(index: usize, rc: bool) -> Result<Self> {
+        // It's unlikely we get more than 2 billion records in a file, but let's check it anyway
         let x: u32 = index
             .try_into()
             .ok()
@@ -73,11 +89,17 @@ impl KmerData {
     }
 }
 
+// From: The ending kmer. To: The starting kmer of the next contig.
 struct Edge {
     from: KmerData,
     to: KmerData,
 }
 
+// We use this LUT (lookup table) to encode arbitrary DNA/RNA nucleotides into two bits.
+// This is to make the Kmer struct smaller - both for memory reasons, but also to
+// make hashing it faster.
+// This will mean contigs with ambiguous nucleotides in the start/ending kmers will be skipped,
+// but I'm not sure MEGAHIT can even process ambiguous kmers in its graph anyway, so no loss.
 const fn make_lut() -> [u8; 256] {
     let mut lut = [0xff; 256];
     let mut i: u8 = 0;
@@ -96,11 +118,14 @@ const fn make_lut() -> [u8; 256] {
 
 const LUT: [u8; 256] = make_lut();
 
-// TODO: Custom 2-bit packed slice type instead
+// See comments above make_lut
 #[derive(PartialEq, Eq, Hash)]
 struct Kmer(Vec<u8>);
 
 impl Kmer {
+    // Return the (forward, reverse_complement) pair, or None if the kmer
+    // contains any bytes not in "AaCcGgTtUu".
+    // The into is a temporary buffer that can be reused between calls.
     fn make_pair(bytes: &[u8], into: &mut [u8]) -> Option<(Self, Self)> {
         translate(bytes, into)?;
         let fw = compact(into);
@@ -110,8 +135,12 @@ impl Kmer {
     }
 }
 
+// Encode a slice of input DNA/RNA bytes to a slice of encodings, where the encodings
+// are the two lower bits of the byte.
 fn translate(s: &[u8], into: &mut [u8]) -> Option<()> {
+    let _: [u8; 256] = LUT; // Statically check LUT has 256 elements
     for (byte, to) in s.iter().zip(into.iter_mut()) {
+        // Safety: a 256-length array cannot be indexed out of bounds with a u8.
         unsafe {
             let b = *LUT.get_unchecked(*byte as usize);
             if b == 0xff {
@@ -124,6 +153,8 @@ fn translate(s: &[u8], into: &mut [u8]) -> Option<()> {
     Some(())
 }
 
+// This works if x is encoded using `translate`.
+// XORing with 3 flips the last 2 bits, switching the encoding of A<->T and C<->G.
 fn reverse_complement(x: &mut [u8]) {
     x.reverse();
     for i in x.iter_mut() {
@@ -131,6 +162,10 @@ fn reverse_complement(x: &mut [u8]) {
     }
 }
 
+// From a slice of encodings where only the two lowest bits are used,
+// we can compact it to a 4x smaller vector.
+// TODO: This ought to be better using as_chunks, but this is not stabilized
+// as of writing.
 fn compact(x: &[u8]) -> Vec<u8> {
     let chunks = x.chunks_exact(4);
     let r = chunks.remainder();
@@ -145,20 +180,29 @@ fn compact(x: &[u8]) -> Vec<u8> {
     v
 }
 
+// Compact a slice of 0-4 encodings to a single u8.
 fn compact_element(s: &[u8]) -> u8 {
     s.iter().fold(0, |old, new| (old << 2) | new)
 }
 
-fn build_graph(
+fn find_edges(
     input: impl BufRead,
     k: u8,
     min_contig_length: usize,
 ) -> Result<(Vec<Option<String>>, Vec<Edge>)> {
+    // According to the GFA specs, FASTA identifiers must conform to this regex.
+    // Too bad if we have identifiers which don't - we must end the program.
     let id_regex = Regex::new(r"^[!-)+-<>-~][!-~]*$").unwrap();
+
+    // Approach: We store the end kmers in a simple vector, then all the starting kmers in a
+    // hash map hashed by the kmer itself.
+    // After we've collected start/end kmers, we loop over every end kmer, find all the start kmers
+    // that have the same Kmer content, then create an edge from end -> start.
     let mut end_kmers: Vec<(Kmer, KmerData)> = Vec::new();
-    let mut start_kmers: HashMap<Kmer, SmallVec<[KmerData; 4]>> = HashMap::new();
+    let mut start_kmers: HashMap<Kmer, SmallVec<[KmerData; 2]>> = HashMap::new();
     let reader = Reader::new(input);
     let k = k as usize;
+    // Temporary buffer used for calls to make_pair.
     let mut buffer: Vec<u8> = vec![0; k];
     // None if the record is skipped due to being too short
     let mut identifiers: Vec<Option<String>> = Vec::new();
@@ -175,17 +219,17 @@ fn build_graph(
             }
             identifiers.push(Some(id));
         }
-        let (start_fw, end_rv) = if let Some((a, b)) = Kmer::make_pair(&seq[..k], &mut buffer) {
-            (a, b)
-        } else {
+        // The start of the sequence contains the starting forward kmer and the ending reverse kmer.
+        // The continue here happens if the seq contains symbols that cannot be enocded to a kmer, which
+        // I believe is rare an relatively unimportant to handle.
+        let Some((start_fw, end_rv)) = Kmer::make_pair(&seq[..k], &mut buffer) else {
             continue;
         };
-        let (end_fw, start_rv) =
-            if let Some((a, b)) = Kmer::make_pair(&seq[seq.len() - k..], &mut buffer) {
-                (a, b)
-            } else {
-                continue;
-            };
+
+        // Vice versa - the end of the sequence contains the ending forward kmer and the starting reverse kmer
+        let Some((end_fw, start_rv)) = Kmer::make_pair(&seq[seq.len() - k..], &mut buffer) else {
+            continue;
+        };
         let fw_data = KmerData::try_new(record_index, false)?;
         let rv_data = KmerData::try_new(record_index, true)?;
         end_kmers.push((end_fw, fw_data));
@@ -193,6 +237,10 @@ fn build_graph(
         start_kmers.entry(start_fw).or_default().push(fw_data);
         start_kmers.entry(start_rv).or_default().push(rv_data);
     }
+    // Now, for every end kmer, we see if there are any matching starting kmers, then
+    // we create an edge from end kmer to start kmer.
+    // Why not from start to end? Remember, if contig B follows contig A, then we
+    // go from the last contig of A to the first contig of B.
     let mut edges: Vec<Edge> = Vec::new();
     for (end_kmer, end_data) in end_kmers.iter() {
         if let Some(v) = start_kmers.get(end_kmer) {
@@ -204,9 +252,8 @@ fn build_graph(
             }
         }
     }
-    // Remove unused names to free up memory
-    drop(start_kmers);
-    drop(end_kmers);
+    // Free up unneeded memory - we can delete all identifiers that have no edge,
+    // then shrink the identifiers vector to not contain trailing Nones.
     let mut used = vec![false; identifiers.len()];
     for edge in edges.iter() {
         used[edge.from.index()] = true;
@@ -230,22 +277,34 @@ fn build_graph(
     Ok((identifiers, edges))
 }
 
-fn write_gfa(identifiers: &[Option<String>], edges: &[Edge]) -> Result<()> {
+fn rc_byte(rc: bool) -> &'static [u8] {
+    if rc {
+        b"-"
+    } else {
+        b"+"
+    }
+}
+
+// Write a minimal GFA
+fn print_gfa(identifiers: &[Option<String>], edges: &[Edge]) -> Result<()> {
     let mut out = BufWriter::new(stdout().lock());
+    // Write header - this is GFA version 1.2
     out.write_all(b"H\tVN:Z:1.2\n")?;
     for edge in edges.iter() {
+        // Write L lines: L
         out.write_all(b"L\t")?;
+        // Name of sequende with end kmer (from)
         out.write_all(identifiers[edge.from.index()].as_ref().unwrap().as_bytes())?;
         out.write_all(b"\t")?;
-        out.write_all(std::slice::from_mut(
-            &mut b"+-"[edge.from.is_rc() as usize].clone(),
-        ))?;
+        // Whether the from sequence is forward or reverse
+        out.write_all(rc_byte(edge.from.is_rc()))?;
         out.write_all(b"\t")?;
+        // Same for the to edge
         out.write_all(identifiers[edge.to.index()].as_ref().unwrap().as_bytes())?;
         out.write_all(b"\t")?;
-        out.write_all(std::slice::from_mut(
-            &mut b"+-"[edge.to.is_rc() as usize].clone(),
-        ))?;
+        out.write_all(rc_byte(edge.to.is_rc()))?;
+        // A star for the missing overlap (which carries no information, the user should know
+        // it's always just one kmer's overlap)
         out.write_all(b"\t*\n")?;
     }
     Ok(())
