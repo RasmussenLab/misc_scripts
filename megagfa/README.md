@@ -10,6 +10,13 @@ Since every vertex is a kmer, this implies that if contig A is a continuation of
 In other words, if contig A ends with the same kmer contig B begins with, there is a high probability that contig B is the true continuation of contig A. Though of course not high enough probability the assembler is willing to fuse the two contigs.
 This information is useful for binning.
 
+## Installation
+* [Install Rust](https://www.rust-lang.org/tools/install)
+* Navigate to this directory, then compile with `cargo build --release`.
+* The binary can be found in `target/release/megagfa`
+
+To compile for Computerome, use `cargo build --release --target=x86_64-unknown-linux-musl`
+
 ## How to use
 ```
 $ megagfa -i final.contigs.fa -k 141 > links.gfa

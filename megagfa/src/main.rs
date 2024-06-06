@@ -113,7 +113,7 @@ fn translate(s: &[u8], into: &mut [u8]) -> Option<()> {
         unsafe {
             let b = *LUT.get_unchecked(*byte as usize);
             if b == 0xff {
-                return None
+                return None;
             } else {
                 *to = b
             }
