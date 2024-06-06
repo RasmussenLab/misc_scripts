@@ -36,11 +36,13 @@ fn main() -> Result<()> {
             }
             None::<()>
         });
-        Box::new(BufReader::new(
-            std::fs::File::open(p.clone()).with_context(|| {
-                format!("Could not open input file \"{}\"", p.to_string_lossy())
-            })?,
-        ))
+        let file = std::fs::File::open(p.clone())
+            .with_context(|| format!("Could not open input file \"{}\"", p.to_string_lossy()))?;
+        if p.extension().is_some_and(|e| e == "gz") {
+            Box::new(BufReader::new(flate2::read::MultiGzDecoder::new(file)))
+        } else {
+            Box::new(BufReader::new(file))
+        }
     } else {
         Box::new(BufReader::new(stdin().lock()))
     };

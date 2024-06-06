@@ -24,7 +24,7 @@ $ megagfa -i final.contigs.fa -k 141 > links.gfa
 * The value passed with `-k` must be equal to the value of `--k-max` that MEGAHIT was run with, else the results will be wrong.
   The default value for MEGAHIT is 141.
   You can find the value for any given run as the largest number in the "k list" printed in the log file.
-* If `-i` is not passed, the program will read from stdin. Hence, to read compressed contigs, use `gunzip -dc final.contigs.fa.gz | megagfa -k 141 > links.gfa`.
+* The input will be gzip decompressed if the file name ends with `.gz`. If `-i` is not passed, the program will read from stdin.
 
 ## Output
 The output printed to stdout is a GFA 1.2 file. It looks like this:
