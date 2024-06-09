@@ -455,7 +455,6 @@ dependencies = [
  "bio",
  "clap",
  "flate2",
- "regex",
  "smallvec",
 ]
 

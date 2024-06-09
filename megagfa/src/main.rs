@@ -1,24 +1,22 @@
 use anyhow::{self, bail, Context, Result};
 use bio::io::fasta::Reader;
 use clap::Parser;
-use regex::Regex;
 use smallvec::SmallVec;
 use std::{
     collections::HashMap,
     io::{stdin, stdout, BufRead, BufReader, BufWriter, Write},
+    num::NonZeroU8,
     path::PathBuf,
 };
 
-fn exitwith(s: &str) {
+fn exitwith(s: &str) -> ! {
     eprintln!("{}", s);
     std::process::exit(1)
 }
 
 fn main() -> Result<()> {
     let args = Cli::parse();
-    if args.k == 0 {
-        exitwith("The value of K cannot be zero")
-    }
+
     // We can read from stdin, from a file, or from a gzipped file. In any case, we wrap the result
     // in a BufRead so we can guarantee the input type implements BufRead.
     let input: Box<dyn BufRead> = if let Some(p) = args.i {
@@ -31,14 +29,13 @@ fn main() -> Result<()> {
         // Check if the user passes e.g. a file k79.contigs.fa, but passes -k 75, where the values
         // of k differ. This will raise an error.
         p.file_name().and_then(|f| f.to_str()).and_then(|s| {
-            let re = Regex::new(r"^k(\d+)\.contigs\.fa$").unwrap();
-            re.captures(s).map(|c| (c, s))
-        }).map(|(caps, s)| {
-            let u = caps[1].parse::<u8>().ok()?;
-            if u != args.k {
-                exitwith(&format!("ERROR: K value passed with -k is {}, but given file is {} with different K value.", args.k, s))
-            }
-            None::<()>
+            s.strip_prefix('k').and_then(|s| s.strip_suffix(".contigs.fa")).and_then(|s| {
+                s.parse::<u8>().ok().map(|k| {
+                    if k != args.k.get() {
+                        exitwith(&format!("ERROR: K value passed with -k is {}, but given file is {} with different K value.", args.k, k))
+                    };
+                })
+            })
         });
         // Return a BufReader wrapping either the opened file directly, or a gzip reader if the file name
         // ends with .gz.
@@ -65,21 +62,11 @@ fn main() -> Result<()> {
 // but this is stored implicitly as the end/start kmers are stored in two different
 // data structures in this program.
 // The information is packed into 32 bits in order to save memory, and to make the data structures
-// that store KmerData smaller and therefore faster.
-#[derive(Clone, Copy)]
-struct KmerData(u32);
+// that store KmerOrigin smaller and therefore faster.
+#[derive(Clone, Copy, Debug)]
+struct KmerOrigin(u32);
 
-impl KmerData {
-    fn try_new(index: usize, rc: bool) -> Result<Self> {
-        // It's unlikely we get more than 2 billion records in a file, but let's check it anyway
-        let x: u32 = index
-            .try_into()
-            .ok()
-            .and_then(|u| if u > 0x7fffffff { None } else { Some(u) })
-            .context("Can only hande 2147483647 FASTA records in one file")?;
-        Ok(Self(x + 0x80000000 * (rc as u32)))
-    }
-
+impl KmerOrigin {
     fn is_rc(&self) -> bool {
         self.0 > 0x7fffffff
     }
@@ -87,12 +74,37 @@ impl KmerData {
     fn index(&self) -> usize {
         (self.0 & 0x7fffffff) as usize
     }
+
+    fn reverse_complement(&self) -> Self {
+        Self(self.0 ^ 0x80000000)
+    }
+}
+
+// Just a convenience struct so we can construct a fw and an rc KmerOrigin in one go
+struct KmerOriginPair {
+    fw: KmerOrigin,
+    rc: KmerOrigin,
+}
+
+impl KmerOriginPair {
+    fn try_new(index: usize) -> Result<Self> {
+        // It's unlikely we get more than 2 billion records in a file, but let's check it anyway
+        let x: u32 = index
+            .try_into()
+            .ok()
+            .and_then(|u| if u > 0x7fffffff { None } else { Some(u) })
+            .context("Can only hande 2147483647 FASTA records in one file")?;
+        Ok(Self {
+            fw: KmerOrigin(x),
+            rc: KmerOrigin(x | 0x80000000),
+        })
+    }
 }
 
 // From: The ending kmer. To: The starting kmer of the next contig.
 struct Edge {
-    from: KmerData,
-    to: KmerData,
+    from_end: KmerOrigin,
+    to_start: KmerOrigin,
 }
 
 // We use this LUT (lookup table) to encode arbitrary DNA/RNA nucleotides into two bits.
@@ -118,162 +130,249 @@ const fn make_lut() -> [u8; 256] {
 
 const LUT: [u8; 256] = make_lut();
 
-// See comments above make_lut
-#[derive(PartialEq, Eq, Hash)]
-struct Kmer(Vec<u8>);
-
-impl Kmer {
-    // Return the (forward, reverse_complement) pair, or None if the kmer
-    // contains any bytes not in "AaCcGgTtUu".
-    // The into is a temporary buffer that can be reused between calls.
-    fn make_pair(bytes: &[u8], into: &mut [u8]) -> Option<(Self, Self)> {
-        translate(bytes, into)?;
-        let fw = compact(into);
-        reverse_complement(into);
-        let rv = compact(into);
-        Some((Kmer(fw), Kmer(rv)))
+// We encode the kmers in two bits, so this is identical to ceiling dividing by 4.
+fn encoding_size(k: NonZeroU8) -> NonZeroU8 {
+    // Safety: If k > 3, the first term is > 0 and < 254.
+    // If k is 1, 2, or 3, the second term is > 0.
+    // Hence the sum will always be nonzero and cannot overflow.
+    unsafe {
+        (k.get() / 4 + ((k.get() % 4) > 0) as u8)
+            .try_into()
+            .unwrap_unchecked()
     }
 }
 
-// Encode a slice of input DNA/RNA bytes to a slice of encodings, where the encodings
-// are the two lower bits of the byte.
-fn translate(s: &[u8], into: &mut [u8]) -> Option<()> {
-    let _: [u8; 256] = LUT; // Statically check LUT has 256 elements
-    for (byte, to) in s.iter().zip(into.iter_mut()) {
-        // Safety: a 256-length array cannot be indexed out of bounds with a u8.
-        unsafe {
-            let b = *LUT.get_unchecked(*byte as usize);
-            if b == 0xff {
-                return None;
-            } else {
-                *to = b
-            }
+// Dense representation of all observed kmers, packed into a single vector.
+struct Kmers {
+    mers: Vec<u8>, // The DNA kmers themselves, packed together. Length: k * data.len()
+    data: Vec<KmerOrigin>,
+    encoding_buffer: Vec<u8>, // length encoding_size(k). Ephemeral.
+    k: NonZeroU8,
+}
+
+impl Kmers {
+    fn new(k: NonZeroU8) -> Self {
+        // Preallocate to avoid unnecessary reallocations. This costs about 3 MB up front.
+        let assumed_kmers = 200_000;
+        Self {
+            mers: Vec::with_capacity(encoding_size(k).get() as usize * assumed_kmers),
+            data: Vec::with_capacity(assumed_kmers),
+            encoding_buffer: vec![0; encoding_size(k).get() as usize],
+            k,
         }
     }
-    Some(())
-}
 
-// This works if x is encoded using `translate`.
-// XORing with 3 flips the last 2 bits, switching the encoding of A<->T and C<->G.
-fn reverse_complement(x: &mut [u8]) {
-    x.reverse();
-    for i in x.iter_mut() {
-        *i ^= 3
+    // How to get the kmers and KmerOrigin out of this struct.
+    fn iter_kmers(&self) -> impl Iterator<Item = (&KmerOrigin, &[u8])> {
+        let chunk_size = self.mers.len() / self.data.len();
+        self.data.iter().zip(self.mers.chunks_exact(chunk_size))
+    }
+
+    // Add the kmers and kmer data from a sequence to this struct.
+    // None if seq too small, or contains non-DNA
+    fn add(&mut self, seq: &[u8], index: usize) -> Option<()> {
+        let KmerOriginPair {
+            fw: fwdata,
+            rc: rvdata,
+        } = KmerOriginPair::try_new(index).ok()?;
+
+        // Add forward starting kmer
+        if translate(
+            seq.get(0..self.k.get() as usize)?,
+            &mut self.encoding_buffer,
+        )
+        .is_some()
+        {
+            self.mers.extend_from_slice(&self.encoding_buffer);
+            self.data.push(fwdata);
+        }
+
+        // Add reverse starting kmer
+        translate(
+            seq.get(seq.len() - self.k.get() as usize..)?,
+            &mut self.encoding_buffer,
+        )?;
+        reverse_complement(self.k, &mut self.encoding_buffer);
+        self.mers.extend_from_slice(&self.encoding_buffer);
+        self.data.push(rvdata);
+        Some(())
     }
 }
 
-// From a slice of encodings where only the two lowest bits are used,
-// we can compact it to a 4x smaller vector.
-// TODO: This ought to be better using as_chunks, but this is not stabilized
-// as of writing.
-fn compact(x: &[u8]) -> Vec<u8> {
-    let chunks = x.chunks_exact(4);
-    let r = chunks.remainder();
-    let len = chunks.len() + !r.is_empty() as usize;
-    let mut v: Vec<u8> = vec![0; len];
-    for (chunk, i) in chunks.zip(v.iter_mut()) {
-        *i = compact_element(chunk)
+// None if the sequence contains a byte which are not ACGTUacgtu.
+fn translate(seq: &[u8], into: &mut [u8]) -> Option<()> {
+    // Handle first chunks of 4, which each are translated to a single byte.
+    let chunks = seq.chunks_exact(4);
+    let (last_encoding, mut is_error) = translate_chunk(chunks.remainder().iter());
+    for (e, (b, err)) in into
+        .iter_mut()
+        .zip(chunks.map(|chunk| translate_chunk(chunk.iter())))
+    {
+        *e = b;
+        is_error |= err;
     }
-    if !r.is_empty() {
-        *v.last_mut().unwrap() = compact_element(r);
+    // Handle last element. We could handle all elements in a single loop using
+    // chunk instead of chunks_exact, but that would cause worse code to be emitted.
+    if let Some(e) = into.last_mut() {
+        *e = last_encoding
     };
-    v
+    if is_error {
+        None
+    } else {
+        Some(())
+    }
 }
 
-// Compact a slice of 0-4 encodings to a single u8.
-fn compact_element(s: &[u8]) -> u8 {
-    s.iter().fold(0, |old, new| (old << 2) | new)
+fn translate_chunk<'a, T: Iterator<Item = &'a u8>>(x: T) -> (u8, bool) {
+    // Statically and locally verify it has 256 elements for safety
+    let lut: [u8; 256] = LUT;
+    x.fold((0, false), |(kmer, is_error), byte| unsafe {
+        let b = lut.get_unchecked(*byte as usize);
+        ((kmer << 2) | b, is_error | (*b == 0xff))
+    })
+}
+
+fn reverse_complement(k: NonZeroU8, kmer: &mut [u8]) -> &[u8] {
+    // First we reverse. We need to reverse each byte (chunk of 4 2-bit symbols)
+    // then we bitreverse each byte.
+    // So e.g. a byte like ABCDEFGH becomes HGFEDCBA, when it should be
+    // GHEFCDAB. So, we also do a bit of bitshuffling to get correctly reversed.
+    // It should optimise well.
+    kmer.reverse();
+    for i in kmer.iter_mut() {
+        *i = {
+            let r = i.reverse_bits();
+            let bitreversed = ((r & 0b10101010) >> 1) | ((r & 0b01010101) << 1);
+            // Also complement by bitwise not on the bits. This works due to how
+            // the nucleotides are stored
+            !bitreversed
+        }
+    }
+
+    // The reversing operation have also reversed where the unused padding bits
+    // are. E.g. for a 5-mer it's encoded as AABBCCDD xxxxxxEE, then when reversed
+    // its EExxxxxx DDCCBBAA, when the correct result is EEDDCCBB xxxxxxAA.
+    // We solve this by shifting the bits.
+    let used_bits = 2 * (k.get() % 4);
+    let unused_bits = 8 - used_bits;
+    let fst = kmer.first_mut().unwrap();
+    // First, shift the first byte. In the example above, it's the EExxxxxx shifted by 6.
+    *fst >>= unused_bits;
+    // It's now xxxxxxEE DDCCBBAA
+
+    // We now need to shift all bytes leftward.
+    for i in 0..kmer.len() - 1 {
+        // Each byte is its own content shifted leftward, OR'd with the next byte,
+        // shifted rightwards.
+        unsafe {
+            let v =
+                (kmer.get_unchecked(i) << unused_bits) | (kmer.get_unchecked(i + 1) >> used_bits);
+            *(kmer.get_unchecked_mut(i)) = v;
+        }
+    }
+    // It's now EEDDCCBB DDCCBBAA
+
+    // The last byte just needs its upper bits masked
+    unsafe { *kmer.last_mut().unwrap_unchecked() &= (1u8 << used_bits).wrapping_sub(1) };
+
+    // We now have EEDDCCBB xxxxxxAA, the correct answer.
+    kmer
+}
+
+#[cfg(test)]
+mod test_rc {
+    use crate::{encoding_size, reverse_complement, translate};
+    use std::num::NonZeroU8;
+
+    #[test]
+    fn test_rc_fn() {
+        for (i, j) in [(b"atcgactacG", b"cGTAGTCGAT")] {
+            let n: NonZeroU8 = i
+                .len()
+                .try_into()
+                .ok()
+                .and_then(|b| NonZeroU8::new(b))
+                .unwrap();
+            assert_eq!(n.get() as usize, j.len());
+            let mut a = vec![0u8; encoding_size(n).get() as usize];
+            let mut b = a.clone();
+            translate(i, &mut a).unwrap();
+            reverse_complement(NonZeroU8::new(10).unwrap(), &mut a);
+            translate(j, &mut b);
+            assert_eq!(a, b);
+        }
+    }
+}
+
+// According to the GFA specs, FASTA identifiers must conform to this pattern.
+// Too bad if we have identifiers which don't - we must end the program.
+fn is_acceptable_identifier(s: &[u8]) -> bool {
+    s.split_first().is_some_and(|(first, rest)| {
+        ((b'!'..=b')').contains(first)
+            | (b'+'..=b'<').contains(first)
+            | (b'>'..=b'~').contains(first))
+            & rest
+                .iter()
+                .fold(true, |acc, b| acc & (b'!'..=b'~').contains(b))
+    })
 }
 
 fn find_edges(
     input: impl BufRead,
-    k: u8,
+    k: NonZeroU8,
     min_contig_length: usize,
 ) -> Result<(Vec<Option<String>>, Vec<Edge>)> {
-    // According to the GFA specs, FASTA identifiers must conform to this regex.
-    // Too bad if we have identifiers which don't - we must end the program.
-    let id_regex = Regex::new(r"^[!-)+-<>-~][!-~]*$").unwrap();
-
-    // Approach: We store the end kmers in a simple vector, then all the starting kmers in a
-    // hash map hashed by the kmer itself.
-    // After we've collected start/end kmers, we loop over every end kmer, find all the start kmers
-    // that have the same Kmer content, then create an edge from end -> start.
-    let mut end_kmers: Vec<(Kmer, KmerData)> = Vec::new();
-    let mut start_kmers: HashMap<Kmer, SmallVec<[KmerData; 2]>> = HashMap::new();
+    // Approach: We store the starting kmers (forward and reverse-complement)
+    // in a HashMap, with keys being kmers and values being KmerOrigin to show
+    // where the kmer is from.
+    // We can then look up in the hash map to match KmerOrigins with shared kmers
+    // and create edges between them
+    let mut kmers = Kmers::new(k);
     let reader = Reader::new(input);
-    let k = k as usize;
-    // Temporary buffer used for calls to make_pair.
-    let mut buffer: Vec<u8> = vec![0; k];
     // None if the record is skipped due to being too short
     let mut identifiers: Vec<Option<String>> = Vec::new();
     for (record_index, record) in reader.records().enumerate() {
         let record = record.context("Failed to parse record from FASTA file")?;
         let seq = record.seq();
-        if seq.len() < k.max(min_contig_length) {
-            identifiers.push(None);
-            continue;
-        } else {
-            let id = record.id().to_owned();
-            if !id_regex.is_match(&id) {
-                bail!("Invalid record identifier: {}.\nIdentifier names are restricted by the GFA format.", id);
+        if seq.len() >= min_contig_length && kmers.add(record.seq(), record_index).is_some() {
+            let id = record.id();
+            if !is_acceptable_identifier(id.as_bytes()) {
+                bail!("Invalid record identifier: {}.\nIdentifier names are restricted by the GFA format to regex [!-)+-<>-~][!-~]*.", id);
             }
-            identifiers.push(Some(id));
+            identifiers.push(Some(id.to_owned()))
+        } else {
+            identifiers.push(None);
         }
-        // The start of the sequence contains the starting forward kmer and the ending reverse kmer.
-        // The continue here happens if the seq contains symbols that cannot be enocded to a kmer, which
-        // I believe is rare an relatively unimportant to handle.
-        let Some((start_fw, end_rv)) = Kmer::make_pair(&seq[..k], &mut buffer) else {
-            continue;
-        };
-
-        // Vice versa - the end of the sequence contains the ending forward kmer and the starting reverse kmer
-        let Some((end_fw, start_rv)) = Kmer::make_pair(&seq[seq.len() - k..], &mut buffer) else {
-            continue;
-        };
-        let fw_data = KmerData::try_new(record_index, false)?;
-        let rv_data = KmerData::try_new(record_index, true)?;
-        end_kmers.push((end_fw, fw_data));
-        end_kmers.push((end_rv, rv_data));
-        start_kmers.entry(start_fw).or_default().push(fw_data);
-        start_kmers.entry(start_rv).or_default().push(rv_data);
     }
     // Now, for every end kmer, we see if there are any matching starting kmers, then
     // we create an edge from end kmer to start kmer.
     // Why not from start to end? Remember, if contig B follows contig A, then we
     // go from the last contig of A to the first contig of B.
+    let mut map: HashMap<&[u8], SmallVec<[KmerOrigin; 2]>> = HashMap::new();
+    for (start_data, kmer) in kmers.iter_kmers() {
+        map.entry(kmer).or_default().push(*start_data);
+    }
+
     let mut edges: Vec<Edge> = Vec::new();
-    for (end_kmer, end_data) in end_kmers.iter() {
-        if let Some(v) = start_kmers.get(end_kmer) {
-            for start_data in v.iter() {
-                edges.push(Edge {
-                    from: *end_data,
-                    to: *start_data,
-                })
+    // Since `map` borrows from `kmers`, we can't mutate the buffer inside `kmers`
+    // and must allocate a new one. No worries.
+    let mut rc_buffer: Vec<u8> = vec![0; encoding_size(k).get() as usize];
+    for (rc_end_kmer, rc_end_datas) in map.iter() {
+        // The map contains starting kmers. By reverse-complementing them, we get
+        // ending kmers, which we then use to look up into the map.
+        rc_buffer.copy_from_slice(rc_end_kmer);
+        let end_kmer = reverse_complement(k, &mut rc_buffer);
+        if let Some(start_datas) = map.get(end_kmer) {
+            for start_data in start_datas.iter() {
+                for rc_end_data in rc_end_datas.iter() {
+                    edges.push(Edge {
+                        from_end: rc_end_data.reverse_complement(),
+                        to_start: *start_data,
+                    })
+                }
             }
         }
     }
-    // Free up unneeded memory - we can delete all identifiers that have no edge,
-    // then shrink the identifiers vector to not contain trailing Nones.
-    let mut used = vec![false; identifiers.len()];
-    for edge in edges.iter() {
-        used[edge.from.index()] = true;
-        used[edge.to.index()] = true;
-    }
-    for (is_used, s) in used.iter().zip(identifiers.iter_mut()) {
-        if !is_used {
-            *s = None;
-        }
-    }
-    let n_used_elements = identifiers
-        .iter()
-        .enumerate()
-        .rev()
-        .find(|(_, n)| n.is_some())
-        .map(|(i, _)| i + 1)
-        .unwrap_or(0);
-
-    identifiers.truncate(n_used_elements);
-    identifiers.shrink_to_fit();
     Ok((identifiers, edges))
 }
 
@@ -294,15 +393,25 @@ fn print_gfa(identifiers: &[Option<String>], edges: &[Edge]) -> Result<()> {
         // Write L lines: L
         out.write_all(b"L\t")?;
         // Name of sequende with end kmer (from)
-        out.write_all(identifiers[edge.from.index()].as_ref().unwrap().as_bytes())?;
+        out.write_all(
+            identifiers[edge.from_end.index()]
+                .as_ref()
+                .unwrap()
+                .as_bytes(),
+        )?;
         out.write_all(b"\t")?;
         // Whether the from sequence is forward or reverse
-        out.write_all(rc_byte(edge.from.is_rc()))?;
+        out.write_all(rc_byte(edge.from_end.is_rc()))?;
         out.write_all(b"\t")?;
         // Same for the to edge
-        out.write_all(identifiers[edge.to.index()].as_ref().unwrap().as_bytes())?;
+        out.write_all(
+            identifiers[edge.to_start.index()]
+                .as_ref()
+                .unwrap()
+                .as_bytes(),
+        )?;
         out.write_all(b"\t")?;
-        out.write_all(rc_byte(edge.to.is_rc()))?;
+        out.write_all(rc_byte(edge.to_start.is_rc()))?;
         // A star for the missing overlap (which carries no information, the user should know
         // it's always just one kmer's overlap)
         out.write_all(b"\t*\n")?;
@@ -320,9 +429,9 @@ Usage: megagfa -i final.contigs.fa -k 141 > links.gfa";
 struct Cli {
     /// Value of --k-max used in assembly
     #[arg(short)]
-    k: u8,
+    k: NonZeroU8,
 
-    /// Input file [stdin if not passed]
+    /// Input file (may be gzipped) [stdin]
     #[arg(short)]
     i: Option<PathBuf>,
 
