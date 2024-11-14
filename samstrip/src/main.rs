@@ -17,7 +17,7 @@ fn main() {
             std::process::exit(1);
         }
     }
-    for line in io::stdin().lock().lines().map(Result::unwrap) {
+    for line in lines {
         if line.starts_with('@') {
             writeln!(&mut stdout, "{}", line).unwrap();
             continue
