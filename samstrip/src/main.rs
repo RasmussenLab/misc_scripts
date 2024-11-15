@@ -1,15 +1,24 @@
 use std::io::{self, BufRead, Write};
 
 fn main() {
-    if std::env::args().any(|arg| arg == "-h" || arg == "--help") {
-        eprintln!("{}", HELP_MESSAGE);
-        std::process::exit(1)
+    if let Some(arg) = std::env::args().nth(1) {
+        if arg == "-h" || arg == "--help" {
+            eprintln!("{}", HELP_MESSAGE);
+            std::process::exit(0)
+        } else if arg == "-V" || arg == "--version" {
+            eprintln!("samstrip version {}", VERSION);
+            std::process::exit(0)
+        } else {
+            eprintln!("Unrecognized argument: {}.\nRun samstrip -h for help.", arg);
+            std::process::exit(1)
+        }
     }
     let mut stdout = io::stdout().lock();
     let mut stdin = io::stdin().lock();
-    let mut line = String::new();
-    let mut n_bytes = stdin.read_line(&mut line).unwrap();
-    if n_bytes > 0 && !line.starts_with('@') {
+    let mut line: Vec<u8> = Vec::new();
+    let mut to_write: Vec<u8> = Vec::new();
+    let mut n_bytes = stdin.read_until(b'\n', &mut line).unwrap();
+    if line.first().map(|&b| b != b'@').unwrap_or(true) {
         eprintln!(
             "Error: First SAM line did not start with a @, indicating a missing header. \
             \nDid you remember to pass in the whole SAM line? \
@@ -17,49 +26,36 @@ fn main() {
         );
         std::process::exit(1);
     }
-    let mut buf = Vec::new();
     while n_bytes > 0 {
-        if line.starts_with('@') {
-            write!(&mut stdout, "{}", line).unwrap();
+        if line.first().map(|&b| b == b'@').unwrap_or(true) {
+            stdout.write_all(&line).unwrap();
             line.clear();
-            n_bytes = stdin.read_line(&mut line).unwrap();
+            n_bytes = stdin.read_until(b'\n', &mut line).unwrap();
             continue;
         }
-        // This whole thing with `vec` vs `buf` is an elaborate workaround for
-        // the borrowchecker. It needs to understand that, although `buf` is defined
-        // outside this loop, and store references to the line in this loop,
-        // it can't possibly hold any invalid references.
-        // We do this with the awkward map unreachable at the end, which somehow
-        // makes the compiler reset the lifetime of buf.
-        let mut vec = buf;
-        vec.extend(line.split('\t'));
-        vec[9] = "*";
-        vec[10] = "*";
-        if let Some(i) = vec[11..].iter().position(|&s| s.starts_with("NM:i:")) {
-            vec[11] = vec[i + 11];
-            vec.truncate(12);
-        } else {
-            vec.truncate(11);
+        let mut fields = line.split(|&b| b == b'\t');
+        if let Some(field) = fields.next() {
+            to_write.extend_from_slice(field);
         }
-        let mut whole_line = vec.join("\t");
-        strip_line(&mut whole_line);
-        writeln!(stdout, "{}", whole_line).unwrap();
-        vec.clear();
-        // See comment where vec is defined
-        buf = vec.into_iter().map(|_| unreachable!()).collect();
+        for field in fields.by_ref().take(8) {
+            to_write.push(b'\t');
+            to_write.extend_from_slice(field);
+        }
+        to_write.extend_from_slice(b"\t*\t*\t");
+        if let Some(nm) = fields.skip(2).filter(|s| s.starts_with(b"NM")).next() {
+            to_write.extend_from_slice(nm);
+        }
+        if !to_write.last().map(|&b| b == b'\n').unwrap_or(false) {
+            to_write.push(b'\n')
+        }
+        stdout.write_all(&to_write).unwrap();
+        to_write.clear();
         line.clear();
-        n_bytes = stdin.read_line(&mut line).unwrap();
+        n_bytes = stdin.read_until(b'\n', &mut line).unwrap();
     }
 }
 
-fn strip_line(s: &mut String) {
-    if s.ends_with('\n') {
-        s.pop();
-        if s.ends_with('\r') {
-            s.pop();
-        }
-    }
-}
+const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 const HELP_MESSAGE: &str = "samstrip
 
@@ -68,5 +64,9 @@ A stripped file has the SEQ and QUAL fields removed, and all optional fields,
 except the NM tag.
 Barring any aligner-specific optional fields, a stripped SAM file contain the
 same alignment information as a full file, but takes up less disk space.
+
+Options:
+    -h --help: Print help
+    -V --version: Print version
 
 Example usage: `samtools view -h file.bam | samstrip | samtools view -b - > stripped.bam`";
