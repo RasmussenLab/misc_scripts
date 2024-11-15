@@ -6,36 +6,62 @@ fn main() {
         std::process::exit(1)
     }
     let mut stdout = io::stdout().lock();
-    let mut lines = io::stdin().lock().lines().map(Result::unwrap).peekable();
-    if let Some(first_line) = lines.peek() {
-        if !first_line.starts_with('@') {
-            eprintln!(
-                "Error: First SAM line did not start with a @, indicating a missing header. \
-                \nDid you remember to pass in the whole SAM line? \
-                If producing the SAM file using `samtools view`, remember the `-h` flag to include the header."
-            );
-            std::process::exit(1);
-        }
+    let mut stdin = io::stdin().lock();
+    let mut line = String::new();
+    let mut n_bytes = stdin.read_line(&mut line).unwrap();
+    if n_bytes > 0 && !line.starts_with('@') {
+        eprintln!(
+            "Error: First SAM line did not start with a @, indicating a missing header. \
+            \nDid you remember to pass in the whole SAM line? \
+            If producing the SAM file using `samtools view`, remember the `-h` flag to include the header."
+        );
+        std::process::exit(1);
     }
-    for line in lines {
+    let mut buf = Vec::new();
+    while n_bytes > 0 {
         if line.starts_with('@') {
-            writeln!(&mut stdout, "{}", line).unwrap();
-            continue
+            write!(&mut stdout, "{}", line).unwrap();
+            line.clear();
+            n_bytes = stdin.read_line(&mut line).unwrap();
+            continue;
         }
-        let mut buf: Vec<_> = line.split('\t').collect();
-        buf[9] = "*";
-        buf[10] = "*";
-        if let Some(i) = buf[11..].iter().position(|&s| s.starts_with("NM:i:")) {
-            buf[11] = buf[i + 11];
-            buf.truncate(12);
+        // This whole thing with `vec` vs `buf` is an elaborate workaround for
+        // the borrowchecker. It needs to understand that, although `buf` is defined
+        // outside this loop, and store references to the line in this loop,
+        // it can't possibly hold any invalid references.
+        // We do this with the awkward map unreachable at the end, which somehow
+        // makes the compiler reset the lifetime of buf.
+        let mut vec = buf;
+        vec.extend(line.split('\t'));
+        vec[9] = "*";
+        vec[10] = "*";
+        if let Some(i) = vec[11..].iter().position(|&s| s.starts_with("NM:i:")) {
+            vec[11] = vec[i + 11];
+            vec.truncate(12);
         } else {
-            buf.truncate(11);
+            vec.truncate(11);
         }
-        writeln!(stdout, "{}", buf.join("\t")).unwrap();
+        let mut whole_line = vec.join("\t");
+        strip_line(&mut whole_line);
+        writeln!(stdout, "{}", whole_line).unwrap();
+        vec.clear();
+        // See comment where vec is defined
+        buf = vec.into_iter().map(|_| unreachable!()).collect();
+        line.clear();
+        n_bytes = stdin.read_line(&mut line).unwrap();
     }
 }
 
-const HELP_MESSAGE: &'static str = "samstrip
+fn strip_line(s: &mut String) {
+    if s.ends_with('\n') {
+        s.pop();
+        if s.ends_with('\r') {
+            s.pop();
+        }
+    }
+}
+
+const HELP_MESSAGE: &str = "samstrip
 
 Reads a SAM file from stdin, and prints the equivalent stripped file to stdout.
 A stripped file has the SEQ and QUAL fields removed, and all optional fields,
