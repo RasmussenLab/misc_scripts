@@ -42,24 +42,13 @@ fn main() {
             std::process::exit(1)
         }
     }
-    let mut stdout = BufWriter::new(io::stdout().lock());
     let mut stdin = BufReader::new(io::stdin().lock());
-    match stdin.fill_buf().unwrap().first().map(|&b| b == b'@') {
-        Some(true) => {}
-        Some(false) => {
-            eprintln!(
-                "Error: First SAM line did not start with a @, indicating a missing header. \
-                \nDid you remember to pass in the whole SAM file? \
-                If producing the SAM file using `samtools view`, remember the `-h` flag to include the header."
-            );
-            std::process::exit(1);
-        }
-        None => std::process::exit(0),
-    }
-
-    let mut line: Vec<u8> = Vec::new();
-    let mut n_bytes = stdin.read_until(b'\n', &mut line).unwrap();
-    if line.first().map(|&b| b != b'@').unwrap_or(true) {
+    if stdin
+        .fill_buf()
+        .unwrap()
+        .first()
+        .is_some_and(|&b| b != b'@')
+    {
         eprintln!(
             "Error: First SAM line did not start with a @, indicating a missing header. \
             \nDid you remember to pass in the whole SAM file? \
@@ -67,12 +56,16 @@ fn main() {
         );
         std::process::exit(1);
     }
-    while n_bytes > 0 {
+    let mut line: Vec<u8> = Vec::new();
+    let mut stdout = BufWriter::new(io::stdout().lock());
+    loop {
+        if stdin.read_until(b'\n', &mut line).unwrap() == 0 {
+            break;
+        }
         // TODO: We could speed this up by copying the header in a separate loop
-        if line.first().map(|&b| b == b'@').unwrap_or(true) {
+        if line.first().map(|&b| b == b'@').unwrap_or(false) {
             stdout.write_all(&line).unwrap();
             line.clear();
-            n_bytes = stdin.read_until(b'\n', &mut line).unwrap();
             continue;
         }
         // Write the line from the start to the 9th tab, as the first 9 fields
@@ -101,7 +94,6 @@ fn main() {
             stdout.write_all(b"\n").unwrap();
         }
         line.clear();
-        n_bytes = stdin.read_until(b'\n', &mut line).unwrap();
     }
 }
 
