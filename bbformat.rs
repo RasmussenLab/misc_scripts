@@ -7,7 +7,7 @@ Example use: cat vamb_clusters.tsv | bbformat > amber.bb";
 // To compile: Install Rust 1.73 or newer.
 // Compile with `rustc -C strip=debuginfo -C opt-level=s bbformat.rs`
 
-use std::io::Write;
+use std::io::{BufWriter, Write};
 
 fn print_help_and_exit() -> ! {
     eprintln!("{}", HELP);
@@ -35,7 +35,7 @@ fn main() {
     let mut lines = s.trim().lines().peekable();
     // Skip the header if it exists
     lines.next_if_eq(&"clustername\tcontigname");
-    let mut stdout = std::io::stdout().lock();
+    let mut stdout = BufWriter::new(std::io::stdout().lock());
     stdout
         .write_all(b"@Version:0.9.1\n@SampleID:all\n\n@@SEQUENCEID\tBINID\n")
         .expect("Unable to write header");
@@ -48,4 +48,5 @@ fn main() {
         }
         writeln!(stdout, "{}\t{}", contig, cluster).expect("Unable to write to output file");
     }
+    stdout.flush().unwrap();
 }
