@@ -76,10 +76,13 @@ end
 # All ranks in NCBI file
 module Ranks
     names = [
+        "acellular root",
         "biotype",
+        "cellular root",
         "clade",
         "class",
         "cohort",
+        "domain",
         "family",
         "forma",
         "forma specialis",
@@ -95,6 +98,7 @@ module Ranks
         "parvorder",
         "pathogroup",
         "phylum",
+        "realm",
         "section",
         "series",
         "serogroup",
@@ -113,9 +117,9 @@ module Ranks
         "subsection",
         "subspecies",
         "subtribe",
+        "subvariety",
         "superclass",
         "superfamily",
-        "superkingdom",
         "superorder",
         "superphylum",
         "tribe",
@@ -158,12 +162,19 @@ const RANK_TO_CANONICAL_INDEX = Dict(
     Ranks.order => 4,
     Ranks.class => 5,
     Ranks.phylum => 6,
-    Ranks.superkingdom => 7,
+    Ranks.domain => 7,
 )
 
 using .NameTypes: NameTypes, NameType
 
 Base.tryparse(::Type{Rank}, s::AbstractString) = get(Ranks.STR_TO_ENUM, s, nothing)
+
+function Base.parse(::Type{Rank}, s::AbstractString)
+    r = tryparse(Rank, s)
+    r === nothing && error(lazy"Could not parse as Rank: \"$(s)\"")
+    r
+end
+
 Base.tryparse(::Type{NameType}, s::AbstractString) = get(NameTypes.STR_TO_ENUM, s, nothing)
 
 struct Node
@@ -209,7 +220,7 @@ function parse_nodes(io::IO)::Vector{Node}
         line = chopsuffix(rstrip(line), "\t|")
         isempty(line) && continue
         (id_str, parent_id_str, rankname) = split(line, "\t|\t")
-        node = Node(parse(Int, id_str), parse(Int, parent_id_str), tryparse(Rank, rankname))
+        node = Node(parse(Int, id_str), parse(Int, parent_id_str), parse(Rank, rankname))
         push!(result, node)
     end
     return result
