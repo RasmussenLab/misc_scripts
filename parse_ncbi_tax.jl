@@ -14,24 +14,43 @@ It creates a list of child/parent pairs, with the following changes from the raw
   For this purpose, the universal ancestor of all life ("LUCA", tax number 1) is canonical.
   
 * Remove all nodes which are not descendant from LUCA
+
+* For nodes with multiple names, pick names according to a preference order, e.g.
+  scientific name before historical names
+
+* Make sure names are unique in the dataset - EXCEPT when two taxids actually point to the
+  same clade. This can happen when two taxids are merged in later NCBI revisions.
+
+* Also add in renamed (merged) nodes, as duplicates of the new node, but under the old taxid.
 =#
 
 function main(args)
-    if length(args) != 3
-        println(stderr, "Usage: julia parse_ncbi_tax.jl outfile names.dmp nodes.dmp")
+    if length(args) != 4
+        println(stderr, "Usage: julia parse_ncbi_tax.jl outfile names.dmp nodes.dmp merged.dmp")
         exit(1)
     end
-    (outpath, namespath, nodespath) = args
+    (outpath, namespath, nodespath, mergedpath) = args
     ispath(outpath) && error("Outpath exists: \"$(outpath)\"")
-    for f in [namespath, nodespath]
+    for f in [namespath, nodespath, mergedpath]
         isfile(f) || error("No such file: \"$(f)\"")
     end
+
+    fields = make_ncbi(namespath, nodespath, mergedpath)
+
     open(outpath, "w") do out
-        make_ncbi(out, namespath, nodespath)
+        println(out, "child_id\tchild_rank\tparent_id\tname")
+        for i in fields
+            println(out, join(i, '\t')::String)
+        end
     end
+    return
 end
 
-function make_ncbi(out::IO, names_path::AbstractString, nodes_path::AbstractString)
+function make_ncbi(
+        names_path::String,
+        nodes_path::String,
+        merged_path::String
+    )::Vector{Tuple{Int, Rank, Int, String}}
     nodes = open(parse_nodes, nodes_path)
     parent_dict = build_parent_dict(nodes)
 
@@ -59,18 +78,35 @@ function make_ncbi(out::IO, names_path::AbstractString, nodes_path::AbstractStri
     # Remove clades not directly descendant from the universal common ancestor
     parent_dict = remove_holey_descendants(parent_dict)
 
+    merged_list = open(parse_merged, merged_path)
+    id_to_node = Dict{Int, Node}()
+
+    # We don't care about parents, because all nodes also appear as children, except id 1
+    # which we assume is not deprecated because that would be weird.
+    for child in keys(parent_dict)
+        L = length(id_to_node)
+        id_to_node[child.id] = child
+        length(id_to_node) == L && error(lazy"Two nodes have id $(child.id)")
+    end
+
     fields = [
         (child.id, child.rank, parent.id, names[child.id][2])
             for (child, parent) in parent_dict
     ]
 
+    # Add deprecated (old merged nodes) to result.
+    # We add it here and not in the parent dict, because we need to use the new
+    # id to look up the name.
+    for (; old, new) in merged_list
+        child = get(id_to_node, new, nothing)
+        child === nothing && continue
+        parent = parent_dict[child]
+        push!(fields, (old, child.rank, parent.id, names[child.id][2]))
+    end
+
     # Make the output file compress better by sorting according to name
     sort!(fields; by = last)
-    println(out, "child_id\tchild_rank\tparent_id\tname")
-    for i in fields
-        println(out, join(i, '\t'))
-    end
-    return
+    return fields
 end
 
 # All ranks in NCBI file
@@ -172,7 +208,7 @@ Base.tryparse(::Type{Rank}, s::AbstractString) = get(Ranks.STR_TO_ENUM, s, nothi
 function Base.parse(::Type{Rank}, s::AbstractString)
     r = tryparse(Rank, s)
     r === nothing && error(lazy"Could not parse as Rank: \"$(s)\"")
-    r
+    return r
 end
 
 Base.tryparse(::Type{NameType}, s::AbstractString) = get(NameTypes.STR_TO_ENUM, s, nothing)
@@ -255,9 +291,9 @@ a species whose direct parent is a family (skipping the genus rank).
 We remove these.
 """
 function make_parent_canonical(
-    parent_of::Dict{Node, Node},
-    rank_to_index::Dict{Rank, <:Integer}
-)
+        parent_of::Dict{Node, Node},
+        rank_to_index::Dict{Rank, <:Integer}
+    )
     new_parents = empty(parent_of)
     for (child, parent) in parent_of
         new_parent = parent
@@ -346,7 +382,7 @@ function get_names(
     # Pick the kind of name we like the best, where multiple names are present.
     # E.g. we prefer "Opacifrons coxata" over "Opacifrons coxata (Stenhammar, 1854)".
     result = Dict(
-        k => argmax(((class, name),) -> Integer(class), v) for (k, v) in names_of_tax
+        k::Int => argmax(((class, name),) -> Integer(class), v)::Tuple{NameType, String} for (k, v) in names_of_tax
     )
     # Assert names are unique
     names = Set{String}()
@@ -361,6 +397,27 @@ function get_names(
         )
     end
     return result
+end
+
+"""
+Parses the merged.dmp file, which contains a list of taxids which has been renamed, or merged with others.
+Returns a list of old taxids and the new id it maps to
+"""
+function parse_merged(io::IO)::Vector{@NamedTuple{old::Int, new::Int}}
+    # Each line looks like this: "12      |       74109   |" with whitespace being single tabs
+    v = Vector{@NamedTuple{old::Int, new::Int}}()
+    for (lineno, line) in enumerate(eachline(io))
+        stripped = rstrip(line)
+        isempty(stripped) && continue
+        m = match(r"^([0-9]+)\t\|\t([0-9]+)\t\|$", stripped)
+        m === nothing && error(
+            "In merged file, on line $(lineno), expected line to fit regex " *
+                "$(repr(r"^([0-9]+)\t\|\t([0-9]+)\t\|$")), but got $(repr(line))"
+        )
+        (old, new) = (something(m.captures[1]), something(m.captures[2]))
+        push!(v, (; old = parse(Int, old), new = parse(Int, new)))
+    end
+    return v
 end
 
 main(ARGS)
