@@ -1,0 +1,17 @@
+[workspace]
+authors = ["Jakob Nybo Nissen <jakobnybonissen@gmail.com>"]
+name = "reclustering"
+platforms = ["linux-64"]
+version = "0.1.0"
+channels = ["conda-forge", "bioconda"]
+
+[tasks]
+start = "python reclustering.py"
+
+[dependencies]
+scikit-learn = ">=1.6.1,<2"
+numpy = ">=2.2.5,<3"
+pandas = ">=2.2.3,<3"
+loguru = ">=0.7.2,<0.8"
+hmmer = ">=3.4,<4"
+prodigal = ">=2.6.3,<3"
