@@ -19,6 +19,26 @@ fn print_usage_and_exit() -> ! {
     std::process::exit(1)
 }
 
+trait ResultExt<T> {
+    fn unwrap_if_not_pipe(self, msg: &str) -> T;
+}
+
+impl<T> ResultExt<T> for std::io::Result<T> {
+    fn unwrap_if_not_pipe(self, msg: &str) -> T {
+        match self {
+            Ok(x) => x,
+            Err(e) => {
+                let kind = e.kind();
+                if matches!(kind, std::io::ErrorKind::BrokenPipe) {
+                    std::process::exit(0)
+                } else {
+                    panic!("{}", msg)
+                }
+            }
+        }
+    }
+}
+
 fn main() {
     let mut too_many_args = false;
     for (argno, arg) in std::env::args().enumerate() {
@@ -38,7 +58,7 @@ fn main() {
     let mut stdout = BufWriter::new(std::io::stdout().lock());
     stdout
         .write_all(b"@Version:0.9.1\n@SampleID:all\n\n@@SEQUENCEID\tBINID\n")
-        .expect("Unable to write header");
+        .unwrap_if_not_pipe("Unable to write header");
     for line in lines {
         let (cluster, contig) = line
             .split_once('\t')
@@ -46,7 +66,10 @@ fn main() {
         if contig.as_bytes().contains(&b'\t') {
             panic!("Input line has more than two tab-separated fields")
         }
-        writeln!(stdout, "{}\t{}", contig, cluster).expect("Unable to write to output file");
+        writeln!(stdout, "{}\t{}", contig, cluster)
+            .unwrap_if_not_pipe("Unable to write to output file");
     }
-    stdout.flush().unwrap();
+    stdout
+        .flush()
+        .unwrap_if_not_pipe("Failed to flush stdout on program exit");
 }
