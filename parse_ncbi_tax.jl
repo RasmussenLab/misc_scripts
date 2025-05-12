@@ -15,6 +15,9 @@ It creates a list of child/parent pairs, with the following changes from the raw
   
 * Remove all nodes which are not descendant from LUCA
 
+* If a clade of a canonical rank has a parent which is not its real immediate parent
+  (e.g. a genus level clade with an order level parent), remove that clade.
+
 * For nodes with multiple names, pick names according to a preference order, e.g.
   scientific name before historical names
 
@@ -24,7 +27,13 @@ It creates a list of child/parent pairs, with the following changes from the raw
 * Also add in renamed (merged) nodes, as duplicates of the new node, but under the old taxid.
 =#
 
-function main(args)
+if VERSION < v"1.11"
+    macro main()
+        :main
+    end
+end
+
+function (@main)(args)
     if length(args) != 4
         println(stderr, "Usage: julia parse_ncbi_tax.jl outfile names.dmp nodes.dmp merged.dmp")
         exit(1)
@@ -420,4 +429,6 @@ function parse_merged(io::IO)::Vector{@NamedTuple{old::Int, new::Int}}
     return v
 end
 
-main(ARGS)
+if VERSION < v"1.11" && abspath(PROGRAM_FILE) == @__FILE__
+    main(ARGS)
+end
