@@ -16,7 +16,8 @@ It creates a list of child/parent pairs, with the following changes from the raw
 * Remove all nodes which are not descendant from LUCA
 
 * If a clade of a canonical rank has a parent which is not its real immediate parent
-  (e.g. a genus level clade with an order level parent), remove that clade.
+  (e.g. a genus level clade with an order level parent), add the missing clades as
+  dummy clades.
 
 * For nodes with multiple names, pick names according to a preference order, e.g.
   scientific name before historical names
@@ -29,7 +30,7 @@ It creates a list of child/parent pairs, with the following changes from the raw
 
 if VERSION < v"1.11"
     macro main()
-        :main
+        return :main
     end
 end
 
@@ -82,7 +83,7 @@ function make_ncbi(
     names[2] = (NameTypes.scientific_name, "Bacteria")
 
     # Remove non-canonical ranks like infraorder.
-    parent_dict = make_parent_canonical(parent_dict, RANK_TO_CANONICAL_INDEX)
+    parent_dict = make_parent_canonical(parent_dict, RANK_TO_CANONICAL_INDEX, names)
 
     # Remove clades not directly descendant from the universal common ancestor
     parent_dict = remove_holey_descendants(parent_dict)
@@ -191,6 +192,7 @@ module NameTypes
         "genbank common name",
         "common name",
         "scientific name",
+        "generated",
     ]
     syms = map(i -> replace(i, " " => "_", "-" => "_"), names)
     @eval @enum NameType::UInt8 $(Symbol.(syms)...)
@@ -198,6 +200,7 @@ module NameTypes
 end
 
 using .Ranks: Ranks, Rank
+using .NameTypes: NameTypes, NameType
 
 # These are the ranks we care to keep
 const RANK_TO_CANONICAL_INDEX = Dict(
@@ -210,7 +213,34 @@ const RANK_TO_CANONICAL_INDEX = Dict(
     Ranks.domain => 7,
 )
 
-using .NameTypes: NameTypes, NameType
+const PREFIXES = [c * '_' for c in "sgfocph"]
+
+const INDEX_TO_CANONICAL_RANK = [
+    Ranks.species,
+    Ranks.genus,
+    Ranks.family,
+    Ranks.order,
+    Ranks.class,
+    Ranks.phylum,
+    Ranks.domain,
+]
+
+global_dummy_id::Int = typemax(Int32)
+
+name_counters::Vector{Int} = fill(0, length(INDEX_TO_CANONICAL_RANK))
+
+function create_new_taxon(rank_index::Integer)
+    global global_dummy_id
+    global name_counters
+
+    id = global_dummy_id
+    global_dummy_id -= 1
+    counter = name_counters[rank_index]
+    name_counters[rank_index] += 1
+
+    name = PREFIXES[rank_index] * "dummy_" * string(counter)
+    return (id, name)
+end
 
 Base.tryparse(::Type{Rank}, s::AbstractString) = get(Ranks.STR_TO_ENUM, s, nothing)
 
@@ -301,31 +331,59 @@ We remove these.
 """
 function make_parent_canonical(
         parent_of::Dict{Node, Node},
-        rank_to_index::Dict{Rank, <:Integer}
+        rank_to_index::Dict{Rank, <:Integer},
+        names::Dict{Int, Tuple{NameType, String}},
     )
     new_parents = empty(parent_of)
     for (child, parent) in parent_of
         new_parent = parent
         parent_index = get(rank_to_index, new_parent.rank, nothing)
+        # Set parent to the closest canonical rank, e.g. if parent was infraorder before
+        # set it to order.
         while !is_top(new_parent) && isnothing(parent_index)
             new_parent = parent_of[new_parent]
             parent_index = get(rank_to_index, new_parent.rank, nothing)
         end
+
         # Tax id 1 (the top) is "all life"
-        parent_index = if is_top(new_parent)
-            8
-        else
-            parent_index
+        parent_index = is_top(new_parent) ? 8 : parent_index
+        child_index = get(rank_to_index, child.rank, nothing)
+
+        # If child is not canonical, we accept whatever parent, since it's
+        # not possible to skip a canonical rank, from the logic above
+        if isnothing(child_index)
+            @assert (child.rank == Ranks.no_rank || child.rank != new_parent.rank)
+            new_parents[child] = new_parent
+            continue
         end
 
-        @assert is_top(new_parent) || child.rank != new_parent.rank
-
-        # A lot of clades have incomplete rankings - e.g. a species
-        # being the child of a "no rank" being the child of an order.
-        # We skip these here.
-        child_index = get(rank_to_index, child.rank, nothing)
-        if child_index === nothing || child_index == parent_index - 1
+        # If child is the true canonical child of the parent, just add it
+        @assert child_index < parent_index
+        if child_index + 1 == parent_index
             new_parents[child] = new_parent
+            continue
+        end
+
+        # Else, we having missing ranks, which we create synthetically
+        @assert child_index + 1 < parent_index
+        ids = Int[]
+        for index in (child_index + 1):(parent_index - 1)
+            (id, name) = create_new_taxon(index)
+            @assert !haskey(names, id)
+            push!(ids, id)
+            names[id] = (NameTypes.generated, name)
+        end
+        missings = Node[]
+        for (i, index) in enumerate((child_index + 1):(parent_index - 1))
+            parent_id = index == parent_index - 1 ? parent_index : ids[i + 1]
+            rank = INDEX_TO_CANONICAL_RANK[index]
+            node = Node(ids[i], parent_id, rank)
+            push!(missings, node)
+        end
+        new_parents[child] = first(missings)
+        new_parents[last(missings)] = new_parent
+        for i in 1:(lastindex(missings) - 1)
+            new_parents[missings[i]] = missings[i + 1]
         end
     end
     return new_parents
