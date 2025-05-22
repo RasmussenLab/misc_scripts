@@ -225,19 +225,18 @@ const INDEX_TO_CANONICAL_RANK = [
     Ranks.domain,
 ]
 
-global_dummy_id::Int = typemax(Int32)
+const ID_COUNTER = Threads.Atomic{Int}(typemax(Int32))
 
-name_counters::Vector{Int} = fill(0, length(INDEX_TO_CANONICAL_RANK))
+const NAME_COUNTERS = fill(0, length(INDEX_TO_CANONICAL_RANK))
+const NAME_COUNTERS_LOCK = ReentrantLock()
 
 function create_new_taxon(rank_index::Integer)
-    global global_dummy_id
-    global name_counters
-
-    id = global_dummy_id
-    global_dummy_id -= 1
-    counter = name_counters[rank_index]
-    name_counters[rank_index] += 1
-
+    id = Threads.atomic_sub!(ID_COUNTER, 1)
+    local counter
+    @lock NAME_COUNTERS_LOCK begin
+        counter = NAME_COUNTERS[rank_index]
+        NAME_COUNTERS[rank_index] += 1
+    end
     name = PREFIXES[rank_index] * "dummy_" * string(counter)
     return (id, name)
 end
