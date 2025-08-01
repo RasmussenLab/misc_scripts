@@ -82,15 +82,12 @@ def fasta_iter(fname, full_header=False):
     header = None
     chunks = []
     if hasattr(fname, "readline"):
-
         def op(f, _):
             return f
-
     elif fname.endswith(".gz"):
         op = gzip.open
     elif fname.endswith(".bz2"):
         import bz2
-
         op = bz2.open
     elif fname.endswith(".xz"):
         op = lzma.open
@@ -187,7 +184,7 @@ def get_marker(
         contig_len = {h.split(".", 1)[1]: len(seq) for h, seq in fasta_iter(fasta_path)}
         data = data[
             data["contig"].map(
-                lambda c: contig_len[c.split(".", 1)[1]] >= min_contig_len
+                lambda c: contig_len.get(c.split(".", 1)[1], 0) >= min_contig_len
             )
         ]
     data = data.drop_duplicates(["gene", "contig"])
@@ -196,7 +193,7 @@ def get_marker(
         from collections import defaultdict
 
         marker = data["gene"].values
-        contig = data["contig"].str.lsplit(".").str[-1].values
+        contig = data["contig"].str.split(".").str[-1].values
         sequence2markers = defaultdict(list)
         for m, c in zip(marker, contig):
             sequence2markers[c].append(m)
@@ -503,7 +500,7 @@ def recluster_bins(
         for k, v in labels_cluster_map.items():
             logger.info(f"\tLabel {k}, {len(v)} contigs")
             indices = [indices_contigs[c] for c in v]
-            contignames = contignames_all[indices]
+            contignames = [contignames_all[i] for i in indices]
             embedding_new = embedding[indices]
             DBSCAN_results_dict = {}
             distance_matrix = pairwise_distances(
